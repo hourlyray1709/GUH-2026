@@ -149,6 +149,7 @@ class Model:
         self.raises = 0
         self.shown = {}
         self.last_bet = None
+        self.pending_response = None
 
     def _check_budget(self):
         if time.perf_counter() > self._deadline:
@@ -176,6 +177,7 @@ class Model:
                 "faced": 8.0,
                 "show_bluff": 1.0,
                 "show_bet": 5.0,
+                "responses": {},
             },
         )
         self.bb = g.big_blind
@@ -254,6 +256,13 @@ class Model:
             cost = min(self.stacks[who], max(self.bets) - self.bets[who])
             pot = sum(self.total)
             if who == self.other and action.kind in ("fold", "call", "raise"):
+                if self.pending_response is not None:
+                    context, predicted = self.pending_response
+                    counts = self.stat["responses"].setdefault(context, [0.0, 0.0, 0])
+                    counts[0] += action.kind == "fold"
+                    counts[1] += predicted
+                    counts[2] += 1
+                    self.pending_response = None
                 self.stat["actions"] += 1
                 if action.kind == "raise":
                     self.stat["raise"] += 1
@@ -441,6 +450,12 @@ class Model:
             if effective <= 2.5 * (pot + cost) or equity > 0.83:
                 targets.add(high)
             fold_rate = self.stat["fold"] / self.stat["faced"]
+            # Calibrate fold forecasts against public replies to our own bets.
+            # Separate preflop/postflop and initial raises/re-raises.
+            context = (bool(self.board), self.raises >= 2)
+            observed, predicted, count = self.stat["responses"].get(context, (0, 0, 0))
+            fold_scale = min(1.5, max(0.1, (observed + 3) / (predicted + 3)))
+            predictions = {}
             for target in targets:
                 self._check_budget()
                 invested = target - g.bets[me]
@@ -452,6 +467,7 @@ class Model:
                 cutoff = 0.17 + 1.1 * fraction + 0.36 * (fold_rate - 0.37)
                 if self.raises >= 1:
                     cutoff += 0.06
+                base_folds = 0
                 aggregate = 0
                 called_mass = 0
                 called_equity = 0
@@ -459,6 +475,8 @@ class Model:
                     if sample % 64 == 0:
                         self._check_budget()
                     continuing = 0.05 + 0.95 * _sigmoid((made - cutoff) / 0.14)
+                    base_folds += 1 - continuing
+                    continuing = 1 - min(0.95, max(0.01, (1 - continuing) * fold_scale))
                     called_mass += continuing
                     called_equity += continuing * outcome
                     leaf_r = (
@@ -469,6 +487,7 @@ class Model:
                     aggregate += (1 - continuing) * pot + continuing * (
                         leaf_r * outcome * (pot + risk + opponent_cost) - risk
                     )
+                predictions[target] = base_folds / len(rows)
                 score = aggregate / len(rows)
                 conditional = called_equity / max(1e-9, called_mass)
                 # Avoid blindly overvaluing marginal raises that permit reraises.
@@ -487,6 +506,7 @@ class Model:
             return fold
         if target is None:
             return call
+        self.pending_response = (context, predictions[target])
         return self._raise(g, target)
 
     def _has_blocker(self):
